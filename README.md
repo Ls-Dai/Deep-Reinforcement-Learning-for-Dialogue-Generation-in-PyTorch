@@ -1,1 +1,5 @@
-# Deep-Reinforcement-Learning-for-Dialogue-Generation-in-PyTorch
+Reinforcement Learning for Dialogue generation
+
+How to train?
+
+`python train.py`
