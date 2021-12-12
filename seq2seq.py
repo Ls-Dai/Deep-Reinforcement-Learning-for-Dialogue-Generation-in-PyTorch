@@ -1,177 +1,174 @@
 import torch
+from torch.jit import script, trace
 import torch.nn as nn
+from torch import optim
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
-from utils import truncate
-from dataloading import PAD_IDX, SOS_IDX, EOS_IDX, MAXLEN
+import csv
+import random
+import re
+import os
+import unicodedata
+import codecs
+from io import open
+import itertools
+import math
+import numpy as np
+from scipy.spatial import distance
 
 
-class Seq2Seq(nn.Module):
-
-    def __init__(self, vocab_size, embed_size, hidden_size=500,
-                 embedding_weight=None, name=None):
-        super(Seq2Seq, self).__init__()
-        self.encoder = Encoder(vocab_size, embed_size, hidden_size, embedding_weight)
-        self.decoder = AttentionDecoder(vocab_size, embed_size, hidden_size, embedding_weight)
-        self.name = name
-
-    def forward(self, merged_hist, resp):
-        encoder_inputs = truncate(merged_hist, 'sos')
-        decoder_inputs = resp
-        encoder_outputs, encoder_hidden = self.encoder(encoder_inputs)
-        decoder_outputs = self.decoder(decoder_inputs[0], encoder_hidden,
-                                       encoder_inputs[0], encoder_outputs)
-        return decoder_outputs
-
-    def generate(self, input_batch):
-
-        def _wrap_batch(outputs):
-            """ wrap (tensor data, lengths) like batch """
-            eos = outputs.new_full((outputs.size(0), 1), EOS_IDX)
-            outputs = torch.cat([outputs, eos], dim=1)
-            lengths = [x.tolist().index(EOS_IDX) + 1 for x in outputs]
-            return outputs, torch.LongTensor(lengths)
-
-        encoder_inputs = truncate(input_batch, 'sos')
-        encoder_outputs, encoder_hidden = self.encoder(encoder_inputs)
-        logits_matrix = self.decoder.decode(encoder_hidden, encoder_inputs[0], encoder_outputs)
-        _, decoder_outputs = logits_matrix.max(dim=2)
-        return logits_matrix, _wrap_batch(decoder_outputs)
-
-    @classmethod
-    def load(cls, path, *args, **kwargs):
-        seq2seq = cls(*args, **kwargs)
-        seq2seq.load_state_dict(torch.load(path))
-        return seq2seq
+# Default word tokens
+PAD_token = 0  # Used for padding short sentences
+SOS_token = 1  # Start-of-sentence token
+EOS_token = 2  # End-of-sentence token
 
 
-class Encoder(nn.Module):
-
-    def __init__(self, vocab_size, embed_size, hidden_size, embedding_weight=None):
-        super(Encoder, self).__init__()
+class EncoderRNN(nn.Module):
+    def __init__(self, hidden_size, embedding, n_layers=1, dropout=0):
+        super(EncoderRNN, self).__init__()
+        self.n_layers = n_layers
         self.hidden_size = hidden_size
-        self.embed_size = embed_size
+        self.embedding = embedding
 
-        if embedding_weight is None:
-            self.embedding = nn.Embedding(vocab_size, self.embed_size)
-        else:
-            self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
+        # Initialize GRU; the input_size and hidden_size params are both set to 'hidden_size'
+        #   because our input size is a word embedding with number of features == hidden_size
+        self.gru = nn.GRU(hidden_size, hidden_size, n_layers,
+                          dropout=(0 if n_layers == 1 else dropout), bidirectional=True)
 
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True)
+    def forward(self, input_seq, input_lengths, hidden=None):
+        # Convert word indexes to embeddings
+        embedded = self.embedding(input_seq)
+        # Pack padded batch of sequences for RNN module
+        packed = nn.utils.rnn.pack_padded_sequence(embedded, input_lengths)
+        # Forward pass through GRU
+        outputs, hidden = self.gru(packed, hidden)
+        # Unpack padding
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(outputs)
+        # Sum bidirectional GRU outputs
+        outputs = outputs[:, :, :self.hidden_size] + \
+            outputs[:, :, self.hidden_size:]
+        # Return output and final hidden state
+        return outputs, hidden
 
-    def forward(self, inputs):
-        sentence_tensor, length = inputs
-        embedded = self.embedding(sentence_tensor)
-        packed = pack_padded_sequence(embedded, length, batch_first=True)
-        output, hidden = self.lstm(packed)
-        output, _ = pad_packed_sequence(output, batch_first=True, total_length=sentence_tensor.size(1))
+
+# Luong attention layer
+class Attn(nn.Module):
+    def __init__(self, method, hidden_size):
+        super(Attn, self).__init__()
+        self.method = method
+        if self.method not in ['dot', 'general', 'concat']:
+            raise ValueError(
+                self.method, "is not an appropriate attention method.")
+        self.hidden_size = hidden_size
+        if self.method == 'general':
+            self.attn = nn.Linear(self.hidden_size, hidden_size)
+        elif self.method == 'concat':
+            self.attn = nn.Linear(self.hidden_size * 2, hidden_size)
+            self.v = nn.Parameter(torch.FloatTensor(hidden_size))
+
+    def dot_score(self, hidden, encoder_output):
+        return torch.sum(hidden * encoder_output, dim=2)
+
+    def general_score(self, hidden, encoder_output):
+        energy = self.attn(encoder_output)
+        return torch.sum(hidden * energy, dim=2)
+
+    def concat_score(self, hidden, encoder_output):
+        energy = self.attn(torch.cat(
+            (hidden.expand(encoder_output.size(0), -1, -1), encoder_output), 2)).tanh()
+        return torch.sum(self.v * energy, dim=2)
+
+    def forward(self, hidden, encoder_outputs):
+        # Calculate the attention weights (energies) based on the given method
+        if self.method == 'general':
+            attn_energies = self.general_score(hidden, encoder_outputs)
+        elif self.method == 'concat':
+            attn_energies = self.concat_score(hidden, encoder_outputs)
+        elif self.method == 'dot':
+            attn_energies = self.dot_score(hidden, encoder_outputs)
+
+        # Transpose max_length and batch_size dimensions
+        attn_energies = attn_energies.t()
+
+        # Return the softmax normalized probability scores (with added dimension)
+        return F.softmax(attn_energies, dim=1).unsqueeze(1)
+
+
+class LuongAttnDecoderRNN(nn.Module):
+    def __init__(self, attn_model, embedding, hidden_size, output_size, n_layers=1, dropout=0.1):
+        super(LuongAttnDecoderRNN, self).__init__()
+
+        # Keep for reference
+        self.attn_model = attn_model
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        self.n_layers = n_layers
+        self.dropout = dropout
+
+        # Define layers
+        self.embedding = embedding
+        self.embedding_dropout = nn.Dropout(dropout)
+        self.gru = nn.GRU(hidden_size, hidden_size, n_layers,
+                          dropout=(0 if n_layers == 1 else dropout))
+        self.concat = nn.Linear(hidden_size * 2, hidden_size)
+        self.out = nn.Linear(hidden_size, output_size)
+
+        self.attn = Attn(attn_model, hidden_size)
+
+    def forward(self, input_step, last_hidden, encoder_outputs):
+        # Note: we run this one step (word) at a time
+        # Get embedding of current input word
+        embedded = self.embedding(input_step)
+        embedded = self.embedding_dropout(embedded)
+        # Forward through unidirectional GRU
+        rnn_output, hidden = self.gru(embedded, last_hidden)
+        # Calculate attention weights from the current GRU output
+        attn_weights = self.attn(rnn_output, encoder_outputs)
+        # Multiply attention weights to encoder outputs to get new "weighted sum" context vector
+        context = attn_weights.bmm(encoder_outputs.transpose(0, 1))
+        # Concatenate weighted context vector and GRU output using Luong eq. 5
+        rnn_output = rnn_output.squeeze(0)
+        context = context.squeeze(1)
+        concat_input = torch.cat((rnn_output, context), 1)
+        concat_output = torch.tanh(self.concat(concat_input))
+        # Predict next word using Luong eq. 6
+        output = self.out(concat_output)
+        output = F.softmax(output, dim=1)
+        # Return output and final hidden state
         return output, hidden
 
 
-class AttentionDecoder(nn.Module):
-    """ Apply attention based on Luong et al. (2015) """
+class GreedySearchDecoder(nn.Module):
+    def __init__(self, encoder, decoder):
+        super(GreedySearchDecoder, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
 
-    def __init__(self, out_vocab_size, embed_size, hidden_size, embedding_weight=None, dropout_p=0.1, max_length=MAXLEN):
-        super(AttentionDecoder, self).__init__()
-        self.out_vocab_size = out_vocab_size
-        self.hidden_size = hidden_size
-        self.embed_size = embed_size
-        self.dropout_p = dropout_p
-        self.max_length = max_length
-        self.batch_size = 1
+    def forward(self, input_seq, input_length, max_length):
+        # device choice
+        USE_CUDA = torch.cuda.is_available()
+        device = torch.device("cuda" if USE_CUDA else "cpu")
 
-        if embedding_weight is None:
-            self.embedding = nn.Embedding(out_vocab_size, embed_size)
-        else:
-            self.embedding = nn.Embedding.from_pretrained(embedding_weight, freeze=True)
-
-        self.attention = nn.Linear(self.hidden_size, self.hidden_size)
-        self.attention_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
-        self.dropout = nn.Dropout(self.dropout_p)
-        self.lstm = nn.LSTM(embed_size, hidden_size, batch_first=True)
-        self.out = nn.Linear(hidden_size, out_vocab_size)
-
-    def forward(self, decoder_inputs, hidden, encoder_inputs, encoder_outputs):
-        batch_size, seq_len = decoder_inputs.size(0), decoder_inputs.size(1)
-        logits_matrix = encoder_outputs.new_zeros(seq_len, batch_size, self.out_vocab_size)
-
-        for i in range(seq_len):
-            embedded = self.embedding(decoder_inputs[:, i]).unsqueeze(1)
-
-            # step 1. lstm
-            lstm_out, hidden = self.lstm(embedded, hidden)
-            h_t = hidden[0].squeeze(0)  # hidden = (batch, hidden)
-
-            # step 2. attention socre(h_t, h_s)
-            attn_weight = self.general_score(encoder_inputs, encoder_outputs, h_t)
-            # attn_weight = self.dot_score(encoder_outputs, hidden)
-
-            # c_t
-            # context = (batch_size, 1, hidden_size)
-            context = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs)
-
-            # h_t = tanh(Wc[c_t;h_t])
-            context = context.squeeze(1)
-            output = torch.cat((context, h_t), dim=1)
-            out_ht = torch.tanh(self.attention_combine(output))  # h_tilda
-
-            logits_output = self.out(out_ht)  # (batch_size, vocab_size)
-            logits_matrix[i] = logits_output
-
-        return logits_matrix.transpose(0, 1)
-
-    def decode(self, hidden, encoder_inputs, encoder_outputs):
-        batch_size = encoder_inputs.size(0)
-        assert batch_size == 1, 'batch_size must be 1 for generating dialogue'
-        logits_matrix = encoder_outputs.new_zeros(MAXLEN, batch_size, self.out_vocab_size)
-        decoder_input = encoder_inputs.new_tensor([batch_size * [SOS_IDX]]).view(batch_size, -1)
-
-        for i in range(MAXLEN):
-            embedded = self.embedding(decoder_input)
-
-            # step 1. lstm
-            lstm_out, hidden = self.lstm(embedded, hidden)
-            h_t = hidden[0].squeeze(0)  # hidden = (batch, hidden)
-
-            # step 2. attention socre(h_t, h_s)
-            attn_weight = self.general_score(encoder_inputs, encoder_outputs, h_t)
-            # attn_weight = self.dot_score(encoder_outputs, hidden)
-
-            # c_t
-            # context = (batch_size, 1, hidden_size)
-            context = torch.bmm(attn_weight.unsqueeze(1), encoder_outputs)
-
-            # h_t = tanh(Wc[c_t;h_t])
-            context = context.squeeze(1)
-            output = torch.cat((context, h_t), dim=1)
-            out_ht = torch.tanh(self.attention_combine(output))  # h_tilda
-
-            logits_output = self.out(out_ht)  # (batch_size, vocab_size)
-            logits_matrix[i] = logits_output
-
-            decoder_input = logits_output.max(dim=1)[1].unsqueeze(1)
-
-        return logits_matrix.transpose(0, 1)
-
-    def general_score(self, encoder_inputs, encoder_outputs, ht):
-        """ step 2. score(h_t, h_s) general score """
-        w_hs = self.attention(encoder_outputs)
-        ht = ht.unsqueeze(2)
-        attn_prod = torch.bmm(w_hs, ht).squeeze(2)
-        attn_prod.masked_fill(encoder_inputs == PAD_IDX, 0)
-        attn_weight = F.softmax(attn_prod, dim=1)
-        return attn_weight  # (batch_size, seq_len)
-
-    def dot_score(self, encoder_outputs, hidden):
-        """ step 2. score(h_t, h_s) dot score """
-        attn_prod = encoder_outputs.new_zeros(encoder_outputs.size(0), self.batch_size)
-        # print(hidden.size()) # (1, 40, 128) need transpose for bmm
-        hidden = hidden.transpose(0, 1)
-
-        # dot score
-        for e in range(encoder_outputs.size(0)):
-            attn_prod[e] = torch.bmm(
-                    hidden, encoder_outputs[e].unsqueeze(2)).view(self.batch_size, -1).transpose(0, 1)
-        return attn_prod
-
-
+        # Forward input through encoder model
+        encoder_outputs, encoder_hidden = self.encoder(input_seq, input_length)
+        # Prepare encoder's final hidden layer to be first hidden input to the decoder
+        decoder_hidden = encoder_hidden[:self.decoder.n_layers]
+        # Initialize decoder input with SOS_token
+        decoder_input = torch.ones(
+            1, 1, device=device, dtype=torch.long) * SOS_token
+        # Initialize tensors to append decoded words to
+        all_tokens = torch.zeros([0], device=device, dtype=torch.long)
+        all_scores = torch.zeros([0], device=device)
+        # Iteratively decode one word token at a time
+        for _ in range(max_length):
+            # Forward pass through decoder
+            decoder_output, decoder_hidden = self.decoder(
+                decoder_input, decoder_hidden, encoder_outputs)
+            # Obtain most likely word token and its softmax score
+            decoder_scores, decoder_input = torch.max(decoder_output, dim=1)
+            # Record token and score
+            all_tokens = torch.cat((all_tokens, decoder_input), dim=0)
+            all_scores = torch.cat((all_scores, decoder_scores), dim=0)
+            # Prepare current token to be next decoder input (add a dimension)
+            decoder_input = torch.unsqueeze(decoder_input, 0)
+        # Return collections of word tokens and scores
+        return all_tokens, all_scores
